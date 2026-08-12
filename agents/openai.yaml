@@ -1,0 +1,5 @@
+interface:
+  display_name: "题库与知识体系工具箱"
+  short_description: "安全采集题库并生成可追溯的 Markdown 知识体系"
+  default_prompt: "使用 $exam-question-toolkit 整理我有权访问的题库，并生成 Markdown 题库、知识体系和质量报告。"
+
