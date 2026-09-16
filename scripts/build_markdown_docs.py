@@ -19,9 +19,15 @@ from typing import Any
 SUPPLEMENT_CHAPTER = 99
 JUNK_QUESTIONS = {"0.02", "0.03", "0.04", "0.05", "0.08", "0.2"}
 PAGE_PATTERN = re.compile(r"_page(\d+)\.txt$", re.IGNORECASE)
+# Option bodies may wrap across lines, so `[\s\S]` is used instead of `.`
+# (`.` does not match newlines even under re.S).
+#
+# The end anchor MUST be \Z, not $: under re.MULTILINE, $ also matches at every
+# line end, so a lazy body would stop as soon as the first option line ended and
+# any wrapped continuation would be silently dropped.
 OPTION_PATTERN = re.compile(
-    r"(?ms)^\s*([A-D])[\.．、]\s*(.*?)"
-    r"(?=^\s*[A-D][\.．、]\s*|^\s*(?:标准答案|答案解析|知识点|所选答案)[：:]|\Z)"
+    r"(?m)^\s*([A-D])[\.．、]\s*([\s\S]*?)"
+    r"(?=^\s*[A-D][\.．、]\s*|^\s*(?:标准答案|答案解析|知识点|所选答案|答案)[：:]|\Z)"
 )
 
 
@@ -56,25 +62,90 @@ def split_blocks(content: str) -> list[str]:
     return [part.strip() for part in re.split(r"(?m)(?=^\s*\d+[\.．、]\s*)", content) if part.strip()]
 
 
-def extract_chapter(knowledge: str, max_chapter: int) -> tuple[int, tuple[int, int, int, int]]:
+def extract_chapter(
+    knowledge: str,
+    max_chapter: int,
+    extra_chapters: dict[str, int] | None = None,
+    chapter_names: dict[str, int] | None = None,
+) -> tuple[int, tuple[int, int, int, int]]:
+    """Derive (chapter, sub-parts) from a knowledge-point label.
+
+    Resolution order:
+      1. explicit label mapping (un-numbered categories such as 综合知识点)
+      2. a leading number, which is authoritative: "11.4.2 《保险法》…" is a
+         citation inside chapter 11, NOT supplementary material, so a 书名号 or
+         a 补充 elsewhere in the label must not override it
+      3. a bare leading number ("7　人身保险产品策略", "6保险公司目标…")
+      4. a declared chapter name supplied by the caller, which supports sources
+         that label chapters with Chinese numerals ("第八章", "第十四章")
+    """
     value = normalize_knowledge(knowledge)
-    if not value or "补充" in value or "《" in value:
+    if not value:
         return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
+
+    if extra_chapters and value in extra_chapters:
+        chapter = extra_chapters[value]
+        if 1 <= chapter <= max_chapter:
+            return chapter, (chapter, 0, 0, 0)
+
     match = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?", value)
-    if not match:
+    if match:
+        parts = tuple(int(match.group(index) or 0) for index in range(1, 5))
+        if 1 <= parts[0] <= max_chapter:
+            return parts[0], parts
         return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
-    parts = tuple(int(match.group(index) or 0) for index in range(1, 5))
-    if not 1 <= parts[0] <= max_chapter:
+
+    bare = re.match(r"^(\d{1,2})(?=[\s\u3000]|[^\d.．、])", value)
+    if bare:
+        chapter = int(bare.group(1))
+        if 1 <= chapter <= max_chapter:
+            return chapter, (chapter, 0, 0, 0)
         return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
-    return parts[0], parts
+
+    if chapter_names and value in chapter_names:
+        chapter = chapter_names[value]
+        if 1 <= chapter <= max_chapter:
+            return chapter, (chapter, 0, 0, 0)
+
+    return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
 
 
 def _field(block: str, label: str) -> str:
-    match = re.search(rf"(?ms)^\s*{label}[：:]\s*(.*?)(?=^\s*(?:知识点|标准答案|答案解析|所选答案)[：:]|\Z)", block)
+    # "答案" is treated as a label so a restated answer inside the analysis
+    # ("解析：… 答案：C. …") cannot bleed into the 解析 field as a stray fragment.
+    # \Z (not $) terminates the value, because under re.MULTILINE $ also matches
+    # at every line end and would cut a wrapped value short.
+    match = re.search(
+        rf"(?ms)^\s*{label}[：:]\s*(.*?)(?=^\s*(?:知识点|标准答案|答案解析|所选答案|答案)[：:]|\Z)",
+        block,
+    )
     return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
 
 
-def parse_block(block: str, max_chapter: int, max_field_chars: int) -> tuple[dict[str, Any] | None, list[str]]:
+LEADING_RESTATED_ANSWER = re.compile(
+    r"^\s*答案[：:]\s*([A-Da-d](?:\s*[、,，]?\s*[A-Da-d])*)\s*[.．、)）]?\s*"
+)
+
+
+def strip_restated_answer(analysis: str) -> str:
+    """Drop a leading restated answer ("答案：C. …") from an analysis field.
+
+    Some sources inline the correct answer at the start of the analysis, glued
+    to the prose without a line break (so the line-oriented label scanning in
+    _field cannot see it). That restatement duplicates the 标准答案 field, so it
+    is removed; the explanatory prose that follows is preserved verbatim.
+    """
+    match = LEADING_RESTATED_ANSWER.match(analysis)
+    return analysis[match.end():] if match else analysis
+
+
+def parse_block(
+    block: str,
+    max_chapter: int,
+    max_field_chars: int,
+    extra_chapters: dict[str, int] | None = None,
+    chapter_names: dict[str, int] | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
     reasons: list[str] = []
     if "答题范围" in block or block[:20].lstrip().startswith("重新答题"):
         return None, ["页面噪声"]
@@ -96,7 +167,7 @@ def parse_block(block: str, max_chapter: int, max_field_chars: int) -> tuple[dic
     answer_match = re.search(r"标准答案[：:]\s*([A-D]+)", block, re.IGNORECASE)
     answer = "".join(dict.fromkeys((answer_match.group(1).upper() if answer_match else "")))
     knowledge = normalize_knowledge(_field(block, "知识点"))
-    analysis = _field(block, "答案解析")
+    analysis = strip_restated_answer(_field(block, "答案解析"))
 
     if not question or question in JUNK_QUESTIONS:
         reasons.append("题干为空或属于已知噪声")
@@ -114,7 +185,7 @@ def parse_block(block: str, max_chapter: int, max_field_chars: int) -> tuple[dic
     if reasons:
         return None, reasons
 
-    chapter, subchapter = extract_chapter(knowledge, max_chapter)
+    chapter, subchapter = extract_chapter(knowledge, max_chapter, extra_chapters, chapter_names)
     return {
         "题目": question,
         "选项": options,
@@ -158,7 +229,12 @@ def discover_pages(input_dir: Path, max_files: int, max_file_bytes: int, max_tot
 
 
 def parse_corpus(
-    pages: list[tuple[int, Path]], max_chapter: int, max_questions: int, max_field_chars: int
+    pages: list[tuple[int, Path]],
+    max_chapter: int,
+    max_questions: int,
+    max_field_chars: int,
+    extra_chapters: dict[str, int] | None = None,
+    chapter_names: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     questions: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -167,7 +243,9 @@ def parse_corpus(
     for page_number, path in pages:
         content = normalize_text(path.read_text(encoding="utf-8"))
         for block_number, block in enumerate(split_blocks(content), 1):
-            question, reasons = parse_block(block, max_chapter, max_field_chars)
+            question, reasons = parse_block(
+                block, max_chapter, max_field_chars, extra_chapters, chapter_names
+            )
             if not question:
                 if reasons != ["页面噪声"]:
                     rejected.append({"页": page_number, "块": block_number, "原因": reasons, "片段": block[:240]})
@@ -374,8 +452,27 @@ def main() -> None:
         parser.error("课程名超过字段长度限制")
 
     chapters = parse_chapters(args.chapters, args.max_field_chars)
+
+    # Reverse map of the declared chapter names. This serves two purposes:
+    #   * sources that label chapters with Chinese numerals ("第八章") resolve to
+    #     their number instead of collapsing into 补充材料;
+    #   * un-numbered source labels get a dedicated section when the caller maps
+    #     them explicitly, e.g. --chapters '{"12":"综合知识点"}'.
+    chapter_names: dict[str, int] = {}
+    for key, label in chapters.items():
+        index = int(key) if str(key).isdigit() else 0
+        if index >= 1 and label not in chapter_names:
+            chapter_names[label] = index
+
     pages = discover_pages(args.input, args.max_files, args.max_file_bytes, args.max_total_bytes)
-    questions, rejected, duplicates = parse_corpus(pages, args.max_chapter, args.max_questions, args.max_field_chars)
+    questions, rejected, duplicates = parse_corpus(
+        pages,
+        args.max_chapter,
+        args.max_questions,
+        args.max_field_chars,
+        None,
+        chapter_names,
+    )
     stem = safe_stem(args.course)
     paths = prepare_outputs(
         args.output_dir,
