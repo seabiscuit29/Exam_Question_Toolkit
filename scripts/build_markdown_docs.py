@@ -19,9 +19,13 @@ from typing import Any
 SUPPLEMENT_CHAPTER = 99
 JUNK_QUESTIONS = {"0.02", "0.03", "0.04", "0.05", "0.08", "0.2"}
 PAGE_PATTERN = re.compile(r"_page(\d+)\.txt$", re.IGNORECASE)
+# Option bodies are matched with `[\s\S]` rather than `.` so a body that wraps
+# across lines cannot be cut short, and the value terminator is \Z rather than $.
+# `答案` joins the label set so a restated answer that follows the last option
+# cannot be absorbed into that option's text.
 OPTION_PATTERN = re.compile(
-    r"(?ms)^\s*([A-D])[\.．、]\s*(.*?)"
-    r"(?=^\s*[A-D][\.．、]\s*|^\s*(?:标准答案|答案解析|知识点|所选答案)[：:]|\Z)"
+    r"(?m)^\s*([A-D])[\.．、]\s*([\s\S]*?)"
+    r"(?=^\s*[A-D][\.．、]\s*|^\s*(?:标准答案|答案解析|知识点|所选答案|答案)[：:]|\Z)"
 )
 
 
@@ -56,22 +60,73 @@ def split_blocks(content: str) -> list[str]:
     return [part.strip() for part in re.split(r"(?m)(?=^\s*\d+[\.．、]\s*)", content) if part.strip()]
 
 
+CN_NUMERALS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def chinese_numeral(text: str) -> int | None:
+    """Convert a Chinese numeral (一…九十九) to an int, or None if not valid."""
+    if not text or any(char not in CN_NUMERALS and char != "十" for char in text):
+        return None
+    if "十" not in text:
+        return CN_NUMERALS.get(text)
+    tens, _, ones = text.partition("十")
+    if text.count("十") != 1:
+        return None
+    high = CN_NUMERALS[tens] if tens else 1
+    low = CN_NUMERALS[ones] if ones else 0
+    return high * 10 + low
+
+
 def extract_chapter(knowledge: str, max_chapter: int) -> tuple[int, tuple[int, int, int, int]]:
+    """Derive (chapter, sub-parts) from a knowledge-point label.
+
+    A leading number is authoritative and is therefore checked before anything
+    else: "11.4.2 《保险法》关于诉讼时效的规定" is a citation inside chapter 11,
+    not supplementary material, so a 书名号 must not override it. Genuinely
+    un-numbered labels ("补充资料《…》", "综合知识点") still fall through to the
+    supplement bucket on their own.
+
+    Sources that label chapters with Chinese numerals ("第八章", "第十四章") are
+    resolved by converting the numeral, so no caller-supplied mapping is needed.
+    """
     value = normalize_knowledge(knowledge)
-    if not value or "补充" in value or "《" in value:
+    if not value:
         return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
     match = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?", value)
-    if not match:
+    if match:
+        parts = tuple(int(match.group(index) or 0) for index in range(1, 5))
+        if 1 <= parts[0] <= max_chapter:
+            return parts[0], parts
         return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
-    parts = tuple(int(match.group(index) or 0) for index in range(1, 5))
-    if not 1 <= parts[0] <= max_chapter:
-        return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
-    return parts[0], parts
+    chinese = re.match(r"^第([一二三四五六七八九十]+)章", value)
+    if chinese:
+        chapter = chinese_numeral(chinese.group(1))
+        if chapter and 1 <= chapter <= max_chapter:
+            return chapter, (chapter, 0, 0, 0)
+    return SUPPLEMENT_CHAPTER, (0, 0, 0, 0)
 
 
 def _field(block: str, label: str) -> str:
-    match = re.search(rf"(?ms)^\s*{label}[：:]\s*(.*?)(?=^\s*(?:知识点|标准答案|答案解析|所选答案)[：:]|\Z)", block)
+    # "答案" is treated as a label so a restated answer cannot bleed into a field.
+    match = re.search(rf"(?ms)^\s*{label}[：:]\s*(.*?)(?=^\s*(?:知识点|标准答案|答案解析|所选答案|答案)[：:]|\Z)", block)
     return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+
+
+LEADING_RESTATED_ANSWER = re.compile(
+    r"^\s*答案[：:]\s*([A-Da-d](?:\s*[、,，]?\s*[A-Da-d])*)\s*[.．、)）]?\s*"
+)
+
+
+def strip_restated_answer(analysis: str) -> str:
+    """Drop a leading restated answer ("答案：C. …") from an analysis field.
+
+    Some sources inline the correct answer at the start of the analysis, glued to
+    the prose without a line break, so the line-oriented label scan in _field
+    cannot see it. The restatement duplicates the 标准答案 field, so only it is
+    removed; the explanatory prose that follows is preserved verbatim.
+    """
+    match = LEADING_RESTATED_ANSWER.match(analysis)
+    return analysis[match.end():] if match else analysis
 
 
 def parse_block(block: str, max_chapter: int, max_field_chars: int) -> tuple[dict[str, Any] | None, list[str]]:
@@ -96,7 +151,7 @@ def parse_block(block: str, max_chapter: int, max_field_chars: int) -> tuple[dic
     answer_match = re.search(r"标准答案[：:]\s*([A-D]+)", block, re.IGNORECASE)
     answer = "".join(dict.fromkeys((answer_match.group(1).upper() if answer_match else "")))
     knowledge = normalize_knowledge(_field(block, "知识点"))
-    analysis = _field(block, "答案解析")
+    analysis = strip_restated_answer(_field(block, "答案解析"))
 
     if not question or question in JUNK_QUESTIONS:
         reasons.append("题干为空或属于已知噪声")

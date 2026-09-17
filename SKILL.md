@@ -54,13 +54,17 @@ description: 安全地采集已获授权的在线题库，解析题干、选项�
 原始页文件使用 `{安全课程名}_page{页码}.txt`，仅包含题目区域文字。执行：
 
 ```bash
-python3 scripts/build_markdown_docs.py \
+python scripts/build_markdown_docs.py \
   --input <原始页目录> \
   --output-dir <本次任务输出目录> \
   --course "<课程名>" \
   --max-chapter 10 \
   --chapters '{"1":"第一章标题","2":"第二章标题"}'
 ```
+
+调用解释器时用 `python`（Windows 上通常只有 `python`；`python3` 仅部分 Linux/macOS 环境提供）。脚本只依赖标准库，无第三方依赖。
+
+`--chapters` 用于渲染章节小标题。知识点自带数字前缀时（如 `11.4.2 《保险法》…`）按该数字归档，无需在此声明；知识点为中文数字章名时（如 `第八章`）会直接解析，也无需声明。
 
 脚本固定输出：
 

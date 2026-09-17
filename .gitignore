@@ -1,0 +1,9 @@
+# Python bytecode caches — regenerated automatically on every import/test run.
+__pycache__/
+*.py[cod]
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
